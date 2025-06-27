@@ -1,51 +1,64 @@
+const Web3 = require('web3');
 const admin = require('firebase-admin');
-const ethers = require('ethers');
+const serviceAccount = require('./firebase-secret.json');
 
-// Load Firebase service account from Render's secret file system
-const serviceAccount = require('/etc/secrets/firebase-secret.json');
-
-// ✅ Use YOUR exact Firebase database URL (same as your dashboard)
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: 'https://shadow-earnings-kaycee-default-rtdb.firebaseio.com/'
+  databaseURL: "https://shadow-earnings-kaycee-default-rtdb.firebaseio.com/",
 });
 
 const db = admin.database();
-const earningsRef = db.ref('totalEarnings');
+const web3 = new Web3("https://bsc-dataseed.binance.org/"); // Binance Smart Chain
 
-// Read from Render Environment
 const PRIVATE_KEY = process.env.SENDER_PRIVATE_KEY;
-const RECEIVER_WALLET = process.env.RECEIVER_WALLET;
+const RECEIVER = process.env.RECEIVER_WALLET;
 
-const NETWORK = "https://bsc-dataseed.binance.org/";
-const provider = new ethers.JsonRpcProvider(NETWORK);
+const USDT_ABI = [{
+  constant: false,
+  inputs: [
+    { name: "_to", type: "address" },
+    { name: "_value", type: "uint256" }
+  ],
+  name: "transfer",
+  outputs: [{ name: "", type: "bool" }],
+  type: "function"
+}];
 
-const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-const usdtContract = new ethers.Contract(
-  '0x55d398326f99059fF775485246999027B3197955', // USDT (BEP-20)
-  ['function transfer(address to, uint amount) public returns (bool)'],
-  wallet
-);
+const USDT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955"; // USDT token contract (BEP-20)
+const USDT = new web3.eth.Contract(USDT_ABI, USDT_ADDRESS);
 
-// Watch for changes in earnings
-earningsRef.on('value', async (snapshot) => {
-  const earnings = snapshot.val() || 0;
-  console.log('📊 Earnings: $' + earnings);
+async function checkAndWithdraw() {
+  const snapshot = await db.ref("visits").once("value");
+  const data = snapshot.val();
+  let total = 0;
 
-  if (earnings >= 100) {
-    console.log('🚀 Reached $100 — withdrawing...');
-    const amount = ethers.parseUnits('100', 18);
+  for (let key in data) {
+    total += data[key].amount || 0;
+  }
+
+  if (total >= 100) {
+    const account = web3.eth.accounts.privateKeyToAccount(PRIVATE_KEY);
+    const amount = web3.utils.toWei(total.toString(), 'mwei'); // USDT has 6 decimals
+
+    const tx = {
+      from: account.address,
+      to: USDT_ADDRESS,
+      gas: 100000,
+      data: USDT.methods.transfer(RECEIVER, amount).encodeABI()
+    };
 
     try {
-      const tx = await usdtContract.transfer(RECEIVER_WALLET, amount);
-      console.log("✅ TX Sent:", tx.hash);
+      const signedTx = await account.signTransaction(tx);
+      const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+      console.log("✅ Withdrawal sent:", receipt.transactionHash);
 
-      await tx.wait();
-      console.log("✅ Confirmed. Earnings reset.");
-
-      await earningsRef.set(0);
+      await db.ref("visits").remove(); // Reset visits after withdrawal
     } catch (error) {
-      console.error("❌ Withdrawal Failed:", error);
+      console.error("❌ Transaction failed:", error.message);
     }
+  } else {
+    console.log(`Not enough earnings. Current: $${total.toFixed(2)}`);
   }
-});
+}
+
+checkAndWithdraw();
